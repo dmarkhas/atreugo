@@ -1,9 +1,11 @@
 package atreugo
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -31,6 +33,7 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 		network                 string
 		gracefulShutdown        bool
 		gracefulShutdownSignals []os.Signal
+		jsonMarshalFunc         JSONMarshalFunc
 		notFoundView            View
 		methodNotAllowedView    View
 		panicView               PanicView
@@ -38,22 +41,26 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 
 	type want struct {
 		gracefulShutdownSignals []os.Signal
+		jsonMarshalFunc         JSONMarshalFunc
 		notFoundView            bool
 		methodNotAllowedView    bool
 		panicView               bool
 		err                     bool
 	}
 
-	notFoundView := func(ctx *RequestCtx) error {
+	jsonMarshalFunc := func(_ io.Writer, _ any) error {
 		return nil
 	}
-	methodNotAllowedView := func(ctx *RequestCtx) error {
+	notFoundView := func(_ *RequestCtx) error {
+		return nil
+	}
+	methodNotAllowedView := func(_ *RequestCtx) error {
 		return nil
 	}
 
 	panicErr := errors.New("error")
-	panicView := func(ctx *RequestCtx, err interface{}) {
-		ctx.Error(panicErr.Error(), fasthttp.StatusInternalServerError)
+	panicView := func(ctx *RequestCtx, err any) {
+		ctx.Error(fmt.Sprint(err), fasthttp.StatusInternalServerError)
 	}
 
 	tests := []struct {
@@ -66,8 +73,7 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 			args: args{},
 			want: want{
 				gracefulShutdownSignals: nil,
-				notFoundView:            false,
-				methodNotAllowedView:    false,
+				jsonMarshalFunc:         defaultJSONMarshalFunc,
 				panicView:               false,
 			},
 		},
@@ -78,6 +84,7 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 			},
 			want: want{
 				gracefulShutdownSignals: defaultGracefulShutdownSignals,
+				jsonMarshalFunc:         defaultJSONMarshalFunc,
 				notFoundView:            false,
 				methodNotAllowedView:    false,
 				panicView:               false,
@@ -89,12 +96,14 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 				network:                 "unix",
 				gracefulShutdown:        true,
 				gracefulShutdownSignals: []os.Signal{syscall.SIGKILL},
+				jsonMarshalFunc:         jsonMarshalFunc,
 				notFoundView:            notFoundView,
 				methodNotAllowedView:    methodNotAllowedView,
 				panicView:               panicView,
 			},
 			want: want{
 				gracefulShutdownSignals: []os.Signal{syscall.SIGKILL},
+				jsonMarshalFunc:         jsonMarshalFunc,
 				notFoundView:            true,
 				methodNotAllowedView:    true,
 				panicView:               true,
@@ -132,6 +141,7 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 				Network:                 tt.args.network,
 				GracefulShutdown:        tt.args.gracefulShutdown,
 				GracefulShutdownSignals: tt.args.gracefulShutdownSignals,
+				JSONMarshalFunc:         tt.args.jsonMarshalFunc,
 				NotFoundView:            tt.args.notFoundView,
 				MethodNotAllowedView:    tt.args.methodNotAllowedView,
 				PanicView:               tt.args.panicView,
@@ -150,23 +160,15 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 				t.Errorf("Logger == %p, want %p", s.cfg.Logger, defaultLogger)
 			}
 
-			if !isEqual(s.cfg.ErrorView, defaultErrorView) {
-				t.Errorf("Error view == %p, want %p", s.cfg.ErrorView, defaultErrorView)
-			}
-
-			if s.router == nil {
-				t.Fatal("Atreugo router instance is nil")
-			}
-
-			if s.router.GlobalOPTIONS != nil {
-				t.Error("GlobalOPTIONS handler is not nil")
-			}
-
 			if !reflect.DeepEqual(tt.want.gracefulShutdownSignals, s.cfg.GracefulShutdownSignals) {
 				t.Errorf(
 					"GracefulShutdownSignals = %v, want %v",
 					s.cfg.GracefulShutdownSignals, tt.want.gracefulShutdownSignals,
 				)
+			}
+
+			if !isEqual(s.cfg.JSONMarshalFunc, tt.want.jsonMarshalFunc) {
+				t.Errorf("JSONMarshalFunc == %p, want %p", s.cfg.JSONMarshalFunc, tt.want.jsonMarshalFunc)
 			}
 
 			if tt.want.notFoundView != (s.router.NotFound != nil) {
@@ -175,6 +177,10 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 
 			if tt.want.methodNotAllowedView != (s.router.MethodNotAllowed != nil) {
 				t.Error("MethodNotAllowed handler is not setted")
+			}
+
+			if !isEqual(s.cfg.ErrorView, defaultErrorView) {
+				t.Errorf("Error view == %p, want %p", s.cfg.ErrorView, defaultErrorView)
 			}
 
 			if tt.want.panicView != (s.router.PanicHandler != nil) {
@@ -189,6 +195,14 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 					t.Errorf("Panic handler response == %s, want %s", ctx.Response.Body(), panicErr.Error())
 				}
 			}
+
+			if s.router == nil {
+				t.Fatal("Atreugo router instance is nil")
+			}
+
+			if s.router.GlobalOPTIONS != nil {
+				t.Error("GlobalOPTIONS handler is not nil")
+			}
 		})
 	}
 }
@@ -196,10 +210,10 @@ func Test_New(t *testing.T) { //nolint:funlen,gocognit,gocyclo
 func Test_newFasthttpServer(t *testing.T) { //nolint:funlen
 	cfg := Config{
 		Name: "test",
-		HeaderReceived: func(header *fasthttp.RequestHeader) fasthttp.RequestConfig {
+		HeaderReceived: func(_ *fasthttp.RequestHeader) fasthttp.RequestConfig {
 			return fasthttp.RequestConfig{}
 		},
-		ContinueHandler:                    func(header *fasthttp.RequestHeader) bool { return true },
+		ContinueHandler:                    func(_ *fasthttp.RequestHeader) bool { return true },
 		Concurrency:                        rand.Int(),                              // nolint:gosec
 		ReadBufferSize:                     rand.Int(),                              // nolint:gosec
 		WriteBufferSize:                    rand.Int(),                              // nolint:gosec
@@ -230,7 +244,7 @@ func Test_newFasthttpServer(t *testing.T) { //nolint:funlen
 		ConnState:                          func(net.Conn, fasthttp.ConnState) {},
 		Logger:                             testLog,
 		TLSConfig:                          &tls.Config{ServerName: "test", MinVersion: tls.VersionTLS13},
-		FormValueFunc:                      func(ctx *fasthttp.RequestCtx, key string) []byte { return nil },
+		FormValueFunc:                      func(_ *fasthttp.RequestCtx, _ string) []byte { return nil },
 	}
 
 	srv := newFasthttpServer(cfg)
@@ -562,7 +576,7 @@ func TestAtreugo_NewVirtualHost(t *testing.T) { //nolint:funlen
 	conflictHosts := []conflictArgs{
 		{
 			hostnames:  []string{hostname},
-			wantErrMsg: fmt.Sprintf("a router is already registered for virtual host: %s", hostname),
+			wantErrMsg: "a router is already registered for virtual host: " + hostname,
 		},
 		{
 			hostnames:  []string{},
@@ -570,7 +584,7 @@ func TestAtreugo_NewVirtualHost(t *testing.T) { //nolint:funlen
 		},
 		{
 			hostnames:  []string{"localhost", "localhost"},
-			wantErrMsg: fmt.Sprintf("a router is already registered for virtual host: %s", hostname),
+			wantErrMsg: "a router is already registered for virtual host: " + hostname,
 		},
 	}
 
@@ -591,16 +605,87 @@ func TestAtreugo_NewVirtualHost(t *testing.T) { //nolint:funlen
 	}
 }
 
+func TestAtreugo_Shutdown(t *testing.T) {
+	s := New(testConfig)
+
+	ln := fasthttputil.NewInmemoryListener()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- s.Serve(ln)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+
+	if err := s.Shutdown(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if lnAddr := ln.Addr().String(); s.cfg.Addr != lnAddr {
+		t.Errorf("Atreugo.Config.Addr = %s, want %s", s.cfg.Addr, lnAddr)
+	}
+
+	lnNetwork := ln.Addr().Network()
+	if s.cfg.Network != lnNetwork {
+		t.Errorf("Atreugo.Config.Network = %s, want %s", s.cfg.Network, lnNetwork)
+	}
+
+	if s.engine.Handler == nil {
+		t.Error("Atreugo.engine.Handler is nil")
+	}
+}
+
+func TestAtreugo_ShutdownWithContext(t *testing.T) {
+	s := New(testConfig)
+
+	ln := fasthttputil.NewInmemoryListener()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- s.Serve(ln)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	if err := s.ShutdownWithContext(ctx); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if lnAddr := ln.Addr().String(); s.cfg.Addr != lnAddr {
+		t.Errorf("Atreugo.Config.Addr = %s, want %s", s.cfg.Addr, lnAddr)
+	}
+
+	lnNetwork := ln.Addr().Network()
+	if s.cfg.Network != lnNetwork {
+		t.Errorf("Atreugo.Config.Network = %s, want %s", s.cfg.Network, lnNetwork)
+	}
+
+	if s.engine.Handler == nil {
+		t.Error("Atreugo.engine.Handler is nil")
+	}
+}
+
 // Benchmarks.
 func Benchmark_Handler(b *testing.B) {
 	s := New(testConfig)
-	s.GET("/plaintext", func(ctx *RequestCtx) error { return nil })
-	s.GET("/json", func(ctx *RequestCtx) error { return nil })
-	s.GET("/db", func(ctx *RequestCtx) error { return nil })
-	s.GET("/queries", func(ctx *RequestCtx) error { return nil })
-	s.GET("/cached-worlds", func(ctx *RequestCtx) error { return nil })
-	s.GET("/fortunes", func(ctx *RequestCtx) error { return nil })
-	s.GET("/updates", func(ctx *RequestCtx) error { return nil })
+	s.GET("/plaintext", func(_ *RequestCtx) error { return nil })
+	s.GET("/json", func(_ *RequestCtx) error { return nil })
+	s.GET("/db", func(_ *RequestCtx) error { return nil })
+	s.GET("/queries", func(_ *RequestCtx) error { return nil })
+	s.GET("/cached-worlds", func(_ *RequestCtx) error { return nil })
+	s.GET("/fortunes", func(_ *RequestCtx) error { return nil })
+	s.GET("/updates", func(_ *RequestCtx) error { return nil })
 
 	ctx := new(fasthttp.RequestCtx)
 	ctx.Request.Header.SetMethod("GET")
