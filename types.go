@@ -127,7 +127,7 @@ type Config struct { // nolint:maligned
 	//   * ErrSmallBuffer
 	//   * ErrBodyTooLarge
 	//   * ErrBrokenChunks
-	ErrorHandler func(ctx *fasthttp.RequestCtx, err error) 
+	ErrorHandler func(ctx *fasthttp.RequestCtx, err error)
 
 	// Configurable view which is called when no matching route is
 	// found. If it is not set, http.NotFound is used.
